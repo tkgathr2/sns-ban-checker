@@ -1,0 +1,5 @@
+flask
+anthropic
+slack-bolt
+requests
+gunicorn
