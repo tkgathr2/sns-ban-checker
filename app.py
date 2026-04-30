@@ -4,9 +4,12 @@ import os
 import logging
 from flask import Flask, request, jsonify
 from slack_bolt.adapter.flask import SlackRequestHandler
-from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # Railway環境では環境変数が直接設定されるため不要
 
 logging.basicConfig(
     level=logging.INFO,
