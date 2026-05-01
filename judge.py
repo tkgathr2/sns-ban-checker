@@ -1,4 +1,4 @@
-"""Claude APIによるSNS投稿バンリスク判定エンジン"""
+"""Claude APIによるSNSガードマン判定エンジン"""
 
 import os
 import json
