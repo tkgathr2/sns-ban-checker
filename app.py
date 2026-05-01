@@ -8,7 +8,7 @@ from slack_bolt.adapter.flask import SlackRequestHandler
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except ImportError:h
+except ImportError:
     pass  # Railway環境では環境変数が直接設定されるため不要
 
 logging.basicConfig(
@@ -34,3 +34,23 @@ def health():
 def slack_events():
     """Slack Event API エンドポイント"""
     return handler.handle(request)
+
+
+@flask_app.route("/", methods=["GET"])
+def index():
+    """ルートページ"""
+    return jsonify(
+        {
+            "service": "SNSガードマン",
+            "version": "1.0.0",
+            "endpoints": {
+                "/health": "ヘルスチェック",
+                "/slack/events": "Slack Event API",
+            },
+        }
+    )
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 3000))
+    flask_app.run(host="0.0.0.0", port=port, debug=True)
