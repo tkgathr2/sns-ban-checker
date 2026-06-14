@@ -2,7 +2,9 @@
 
 import os
 import re
+import json
 import logging
+import tempfile
 import threading
 
 from slack_bolt import App
@@ -12,6 +14,13 @@ from notion_client import (
     log_ban,
     log_post,
     update_post_ban_status,
+)
+from video_analyzer import (
+    is_video_file,
+    download_slack_file,
+    judge_video,
+    format_video_slack_response,
+    VIDEO_MAX_SIZE_MB,
 )
 
 logger = logging.getLogger(__name__)
@@ -253,6 +262,179 @@ def handle_message(event, say):
         )
         thread.start()
         return
+
+
+@app.event("file_shared")
+def handle_file_shared(event, client):
+    """動画ファイルが共有されたときにプラットフォーム選択UIを表示する"""
+    channel_id = event.get("channel_id")
+    file_id = event.get("file_id")
+
+    ban_checker_channel = os.environ.get("BAN_CHECKER_CHANNEL_ID")
+    if not ban_checker_channel or channel_id != ban_checker_channel:
+        return
+
+    thread = threading.Thread(
+        target=_handle_video_upload,
+        args=(file_id, channel_id, client),
+        daemon=True,
+    )
+    thread.start()
+
+
+def _handle_video_upload(file_id: str, channel_id: str, client):
+    try:
+        file_info = client.files_info(file=file_id)
+        file_data = file_info["file"]
+        mimetype = file_data.get("mimetype", "")
+        filename = file_data.get("name", "動画")
+        file_size_bytes = file_data.get("size", 0)
+
+        if not is_video_file(mimetype):
+            return
+
+        file_size_mb = file_size_bytes / (1024 * 1024)
+        if file_size_mb > VIDEO_MAX_SIZE_MB:
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"動画サイズが上限（{VIDEO_MAX_SIZE_MB}MB）を超えています（{file_size_mb:.1f}MB）。",
+            )
+            return
+
+        client.chat_postMessage(
+            channel=channel_id,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"動画「*{filename}*」（{file_size_mb:.1f}MB）が共有されました。\n"
+                            "どのSNS用の動画か選択してください:"
+                        ),
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "TikTok"},
+                            "style": "primary",
+                            "action_id": "video_judge",
+                            "value": json.dumps(
+                                {"file_id": file_id, "platform": "TikTok", "channel": channel_id}
+                            ),
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Facebook"},
+                            "action_id": "video_judge",
+                            "value": json.dumps(
+                                {"file_id": file_id, "platform": "Facebook", "channel": channel_id}
+                            ),
+                        },
+                    ],
+                },
+            ],
+        )
+    except Exception as e:
+        logger.error(f"動画ファイル処理エラー: {e}", exc_info=True)
+
+
+@app.action("video_judge")
+def handle_video_judge_action(ack, body, client):
+    """動画判定ボタンのアクション処理"""
+    ack()
+
+    value = json.loads(body["actions"][0]["value"])
+    file_id = value["file_id"]
+    platform = value["platform"]
+    channel = value["channel"]
+    message_ts = body.get("message", {}).get("ts")
+
+    thread = threading.Thread(
+        target=_process_video_judgment,
+        args=(file_id, platform, channel, message_ts, client),
+        daemon=True,
+    )
+    thread.start()
+
+
+def _process_video_judgment(file_id: str, platform: str, channel: str, thread_ts: str, client):
+    """動画判定処理（バックグラウンドスレッド用）"""
+    bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
+
+    thinking = client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=f"動画を分析中です... しばらくお待ちください（1〜2分）",
+    )
+
+    try:
+        file_info = client.files_info(file=file_id)
+        file_data = file_info["file"]
+        download_url = (
+            file_data.get("url_private_download") or file_data.get("url_private")
+        )
+        filename = file_data.get("name", "video")
+
+        if not download_url:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text="動画のダウンロードURLが取得できませんでした。",
+            )
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            download_slack_file(download_url, tmp_path, bot_token)
+            result = judge_video(tmp_path, platform)
+            response_text = format_video_slack_response(result, platform)
+
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=response_text,
+            )
+
+            try:
+                client.chat_delete(channel=channel, ts=thinking["ts"])
+            except Exception:
+                pass
+
+            try:
+                log_judgement(
+                    post_text=f"[動画: {filename}]",
+                    sns=platform,
+                    risk_level=result.get("risk_level", "🟡中"),
+                    result_text=response_text,
+                    user_name="動画判定",
+                    slack_link="",
+                )
+            except Exception as e:
+                logger.warning(f"Notion動画ログ記録エラー: {e}")
+
+            logger.info(
+                f"動画判定完了: platform={platform}, risk={result.get('risk_level')}, "
+                f"frames={result.get('frame_count')}, duration={result.get('duration'):.0f}s"
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.error(f"動画判定エラー: {e}", exc_info=True)
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f"動画の分析中にエラーが発生しました: {str(e)[:200]}",
+        )
 
 
 @app.event("reaction_added")

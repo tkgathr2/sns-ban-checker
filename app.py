@@ -42,7 +42,7 @@ def index():
     return jsonify(
         {
             "service": "SNSガードマン",
-            "version": "1.0.0",
+            "version": "2.0.0",
             "endpoints": {
                 "/health": "ヘルスチェック",
                 "/slack/events": "Slack Event API",
